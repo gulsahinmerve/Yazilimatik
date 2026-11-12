@@ -1,0 +1,8 @@
+{
+  "name": "Yazılımatik - Yapay Zekâ Destekli Yazılı Puanlama ve Excel Aktarım Sistemi",
+  "description": "Öğretmenlerin sınav kâğıtlarındaki kırmızı kalemle yazılmış soru puanlarını kamera ile okuyup otomatik toplayan ve Excel / e-Okul formatında aktaran akıllı sistem.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
