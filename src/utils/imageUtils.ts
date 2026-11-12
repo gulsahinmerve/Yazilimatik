@@ -2,6 +2,44 @@
  * Image processing utilities for exam paper scanning
  */
 
+// Optimize and resize image for ultra-fast upload (scales down 4000px raw photos to 1600px)
+export async function optimizeImageForUpload(dataUrl: string, maxDimension: number = 1600): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let w = img.width;
+      let h = img.height;
+
+      if (w <= maxDimension && h <= maxDimension) {
+        return resolve(dataUrl);
+      }
+
+      if (w > h) {
+        if (w > maxDimension) {
+          h = Math.round((h * maxDimension) / w);
+          w = maxDimension;
+        }
+      } else {
+        if (h > maxDimension) {
+          w = Math.round((w * maxDimension) / h);
+          h = maxDimension;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return resolve(dataUrl);
+
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL('image/jpeg', 0.88));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
 // Rotate an image data URL by given degrees (90, 180, 270)
 export async function rotateImageDataUrl(dataUrl: string, degrees: number): Promise<string> {
   return new Promise((resolve) => {
@@ -23,7 +61,7 @@ export async function rotateImageDataUrl(dataUrl: string, degrees: number): Prom
       ctx.rotate((degrees * Math.PI) / 180);
       ctx.drawImage(img, -img.width / 2, -img.height / 2);
 
-      resolve(canvas.toDataURL('image/jpeg', 0.92));
+      resolve(canvas.toDataURL('image/jpeg', 0.90));
     };
     img.src = dataUrl;
   });

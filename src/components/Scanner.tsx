@@ -16,7 +16,7 @@ import {
   Layers,
   ArrowRight
 } from 'lucide-react';
-import { rotateImageDataUrl, enhanceImage, checkImageBlur } from '../utils/imageUtils';
+import { rotateImageDataUrl, enhanceImage, checkImageBlur, optimizeImageForUpload } from '../utils/imageUtils';
 import { getSampleStudentExam } from '../services/samplePaperGenerator';
 
 interface ScannerProps {
@@ -40,7 +40,7 @@ export const Scanner: React.FC<ScannerProps> = ({
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   // Image enhancement sliders
@@ -53,6 +53,7 @@ export const Scanner: React.FC<ScannerProps> = ({
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const nativeCameraInputRef = useRef<HTMLInputElement>(null);
 
   // Start / Stop Camera
   const startCamera = async (mode: 'environment' | 'user' = facingMode) => {
@@ -61,7 +62,7 @@ export const Scanner: React.FC<ScannerProps> = ({
     try {
       const constraints: MediaStreamConstraints = {
         video: {
-          facingMode: mode,
+          facingMode: { ideal: mode },
           width: { ideal: 1920 },
           height: { ideal: 1080 },
         },
@@ -69,27 +70,37 @@ export const Scanner: React.FC<ScannerProps> = ({
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
+      setIsCameraActive(true);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.play().catch((e) => console.log('Autoplay error:', e));
       }
-      setIsCameraActive(true);
     } catch (err: any) {
-      console.warn('Camera facingMode error, fallback to any video:', err);
+      console.warn('Camera facingMode error, fallback to standard video:', err);
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         streamRef.current = stream;
+        setIsCameraActive(true);
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play();
+          videoRef.current.play().catch((e) => console.log('Autoplay error:', e));
         }
-        setIsCameraActive(true);
       } catch (fallbackErr: any) {
-        setCameraError('Kamera erişimine izin verilmedi veya uygun kamera cihazı bulunamadı. Lütfen galeriden dosya yüklemeyi kullanınız.');
+        setCameraError('Kamera erişimine izin verilmedi veya tarayıcı iframe izin kısıtı var. Lütfen aşağıdaki "Cihaz Kamerası ile Çek" butonunu kullanarak doğrudan telefonunuzun kendi kamera uygulamasını açınız.');
         setIsCameraActive(false);
       }
     }
   };
+
+  // Sync stream to video whenever isCameraActive changes
+  useEffect(() => {
+    if (isCameraActive && videoRef.current && streamRef.current) {
+      if (videoRef.current.srcObject !== streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+      }
+      videoRef.current.play().catch((err) => console.log('Video play error:', err));
+    }
+  }, [isCameraActive]);
 
   const stopCamera = () => {
     if (streamRef.current) {
@@ -112,6 +123,12 @@ export const Scanner: React.FC<ScannerProps> = ({
   const capturePhoto = async () => {
     if (!videoRef.current) return;
     const video = videoRef.current;
+    
+    // Ensure video dimensions are ready
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth || 1280;
     canvas.height = video.videoHeight || 720;
@@ -133,15 +150,17 @@ export const Scanner: React.FC<ScannerProps> = ({
     startCamera(nextMode);
   };
 
-  // Apply new captured or uploaded image
+  // Apply new captured or uploaded image with auto-downscaling for speed
   const applyCapturedImage = async (dataUrl: string) => {
-    const blur = await checkImageBlur(dataUrl);
+    // Quickly optimize to max 1600px so upload is ultra fast
+    const optimized = await optimizeImageForUpload(dataUrl, 1600);
+    const blur = await checkImageBlur(optimized);
     setBlurWarning(blur.isBlurry);
 
     if (activeSide === 'front') {
-      setFrontImage(dataUrl);
+      setFrontImage(optimized);
     } else {
-      setBackImage(dataUrl);
+      setBackImage(optimized);
     }
   };
 
@@ -378,7 +397,13 @@ export const Scanner: React.FC<ScannerProps> = ({
             {isCameraActive && (
               <div className="relative w-full h-full flex items-center justify-center">
                 <video
-                  ref={videoRef}
+                  ref={(el) => {
+                    videoRef.current = el;
+                    if (el && streamRef.current && el.srcObject !== streamRef.current) {
+                      el.srcObject = streamRef.current;
+                      el.play().catch((e) => console.log('Autoplay error:', e));
+                    }
+                  }}
                   playsInline
                   autoPlay
                   muted
@@ -469,20 +494,30 @@ export const Scanner: React.FC<ScannerProps> = ({
                   Telefon kamerasıyla kâğıdı fotoğraflayabilir, galeriden yükleyebilir veya üstteki hızlı örnek kâğıdı deneyebilirsiniz.
                 </p>
 
-                <div className="flex items-center justify-center gap-3">
+                <div className="flex flex-wrap items-center justify-center gap-2.5">
                   <button
                     type="button"
                     onClick={() => startCamera('environment')}
-                    className="flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-xl shadow-xs transition-colors cursor-pointer"
+                    className="flex items-center gap-2 px-3.5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-xl shadow-xs transition-colors cursor-pointer"
                   >
                     <Camera className="w-4 h-4" />
-                    <span>Kamerayı Başlat</span>
+                    <span>Canlı Kamera Aç</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => nativeCameraInputRef.current?.click()}
+                    className="flex items-center gap-2 px-3.5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl shadow-xs transition-colors cursor-pointer"
+                    title="Telefonun kendi kamera uygulamasını açar"
+                  >
+                    <Camera className="w-4 h-4" />
+                    <span>Cihaz Kamerası ile Çek</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="flex items-center gap-2 px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl transition-colors cursor-pointer"
+                    className="flex items-center gap-2 px-3.5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl transition-colors cursor-pointer"
                   >
                     <Upload className="w-4 h-4" />
                     <span>Galeriden Seç</span>
@@ -491,11 +526,21 @@ export const Scanner: React.FC<ScannerProps> = ({
               </div>
             )}
 
-            {/* Hidden file input */}
+            {/* Hidden file input for gallery */}
             <input
               ref={fileInputRef}
               type="file"
               accept="image/*"
+              className="hidden"
+              onChange={handleFileUpload}
+            />
+
+            {/* Hidden file input for native device camera */}
+            <input
+              ref={nativeCameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
               className="hidden"
               onChange={handleFileUpload}
             />

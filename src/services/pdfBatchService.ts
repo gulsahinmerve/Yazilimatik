@@ -51,100 +51,101 @@ export async function createSampleBatchExamPdf(): Promise<{ bytes: Uint8Array; b
 }
 
 /**
- * Analyzes a multi-student exam PDF file:
- * - Reads page count
- * - If under 8 pages: sends in 1 request for maximum speed
- * - If larger (e.g. 37 students, 74 pages): splits into 4-page chunks using pdf-lib,
- *   streaming real-time results and progress to the caller.
+ * High-speed single-pass batch exam PDF analyzer.
+ * Reads file efficiently without freezing the browser thread and receives
+ * all extracted students in seconds.
  */
 export async function processBatchExamPdf(
   file: File,
   exam: Exam,
   onProgress?: (progress: BatchProcessingProgress) => void
 ): Promise<BatchStudentAnalysis[]> {
-  const arrayBuffer = await file.arrayBuffer();
-  const pdfBytes = new Uint8Array(arrayBuffer);
+  onProgress?.({
+    currentChunk: 1,
+    totalChunks: 1,
+    totalPages: 1,
+    percent: 20,
+    statusText: 'PDF yükleniyor ve hazırlanıyor...',
+    foundStudents: [],
+  });
 
-  const mainPdfDoc = await PDFDocument.load(pdfBytes);
-  const totalPages = mainPdfDoc.getPageCount();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
 
-  if (totalPages === 0) {
-    throw new Error('Yüklenen PDF dosyasında hiçbir sayfa bulunamadı.');
-  }
-
-  // Determine chunk size (e.g. 4 pages per chunk = ~2 students per chunk)
-  const PAGES_PER_CHUNK = 4;
-  const totalChunks = Math.ceil(totalPages / PAGES_PER_CHUNK);
-  const allFoundStudents: BatchStudentAnalysis[] = [];
-
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-    const startPage = chunkIndex * PAGES_PER_CHUNK;
-    const endPage = Math.min(startPage + PAGES_PER_CHUNK, totalPages);
-    const pageIndices = [];
-    for (let p = startPage; p < endPage; p++) {
-      pageIndices.push(p);
-    }
-
-    const chunkDoc = await PDFDocument.create();
-    const copiedPages = await chunkDoc.copyPages(mainPdfDoc, pageIndices);
-    copiedPages.forEach((p) => chunkDoc.addPage(p));
-
-    const chunkBase64 = await chunkDoc.saveAsBase64({ dataUri: true });
-
-    const statusText = `Sayfa ${startPage + 1} - ${endPage} / ${totalPages} taranıyor...`;
-    const percent = Math.round(((chunkIndex + 0.3) / totalChunks) * 100);
-
-    onProgress?.({
-      currentChunk: chunkIndex + 1,
-      totalChunks,
-      totalPages,
-      percent,
-      statusText,
-      foundStudents: [...allFoundStudents],
-    });
-
-    try {
-      const response = await fetch('/api/analyze-pdf-batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pdfBase64: chunkBase64,
-          questionsConfig: exam.questions,
-          examInfo: {
-            courseName: exam.courseName,
-            gradeClass: exam.gradeClass,
-            section: exam.section,
-          },
-          pageRangeInfo: `Sayfa ${startPage + 1}-${endPage}`,
-        }),
-      });
-
-      const resData = await response.json();
-
-      if (response.ok && resData.success && Array.isArray(resData.data)) {
-        const chunkStudents: BatchStudentAnalysis[] = resData.data.map((st: any) => ({
-          ...st,
-          pagesDetected: st.pagesDetected || `Sayfa ${startPage + 1}-${endPage}`,
-        }));
-
-        allFoundStudents.push(...chunkStudents);
-      } else {
-        console.warn(`Chunk ${chunkIndex + 1} analysis warning:`, resData.error);
+    reader.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        const p = Math.round((ev.loaded / ev.total) * 40);
+        onProgress?.({
+          currentChunk: 1,
+          totalChunks: 1,
+          totalPages: 1,
+          percent: p,
+          statusText: 'PDF okunuyor...',
+          foundStudents: [],
+        });
       }
-    } catch (chunkErr) {
-      console.error(`Chunk ${chunkIndex + 1} error:`, chunkErr);
-    }
+    };
 
-    const completedPercent = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-    onProgress?.({
-      currentChunk: chunkIndex + 1,
-      totalChunks,
-      totalPages,
-      percent: completedPercent,
-      statusText: `${allFoundStudents.length} öğrenci tespit edildi (${completedPercent}%)`,
-      foundStudents: [...allFoundStudents],
-    });
-  }
+    reader.onload = async () => {
+      try {
+        const fullBase64 = reader.result as string;
 
-  return allFoundStudents;
+        onProgress?.({
+          currentChunk: 1,
+          totalChunks: 1,
+          totalPages: 1,
+          percent: 60,
+          statusText: 'Öğrenci kâğıtları ve kırmızı kalem puanları taranıyor...',
+          foundStudents: [],
+        });
+
+        // Fast fetch with timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+        const response = await fetch('/api/analyze-pdf-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            pdfBase64: fullBase64,
+            questionsConfig: exam.questions,
+            examInfo: {
+              courseName: exam.courseName,
+              gradeClass: exam.gradeClass,
+              section: exam.section,
+            },
+            pageRangeInfo: 'Tüm Sayfalar',
+          }),
+        });
+
+        clearTimeout(timeoutId);
+
+        const resData = await response.json();
+
+        if (response.ok && resData.success && Array.isArray(resData.data)) {
+          onProgress?.({
+            currentChunk: 1,
+            totalChunks: 1,
+            totalPages: resData.data.length,
+            percent: 100,
+            statusText: `${resData.data.length} öğrenci başarıyla ayrıştırıldı!`,
+            foundStudents: resData.data,
+          });
+          resolve(resData.data);
+        } else {
+          throw new Error(resData.error || 'PDF analizi tamamlanamadı.');
+        }
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          reject(new Error('İşlem zaman aşımına uğradı. Lütfen dosya boyutunu kontrol ediniz.'));
+        } else {
+          reject(err);
+        }
+      }
+    };
+
+    reader.onerror = () => reject(new Error('Dosya okunamadı.'));
+    reader.readAsDataURL(file);
+  });
 }

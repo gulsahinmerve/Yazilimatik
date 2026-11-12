@@ -11,11 +11,16 @@ import {
   ArrowRight, 
   Download,
   Users,
-  Edit2,
   Trash2,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Check
 } from 'lucide-react';
 import { processBatchExamPdf, createSampleBatchExamPdf, BatchProcessingProgress } from '../services/pdfBatchService';
+import { 
+  exportQuestionScoresExcel, 
+  exportTotalScoresSummary, 
+  exportFullDetailedExcel 
+} from '../services/excelService';
 
 interface BatchPdfUploaderProps {
   currentExam: Exam | null;
@@ -28,18 +33,69 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
   currentExam,
   onBulkStudentsImported,
   onNavigateToCreateExam,
-  onOpenExcelExport,
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileDetails, setFileDetails] = useState<{ name: string; sizeMb: string } | null>(null);
 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [progress, setProgress] = useState<BatchProcessingProgress | null>(null);
-  const [discoveredStudents, setDiscoveredStudents] = useState<BatchStudentAnalysis[]>([]);
+  const [analyzedStudents, setAnalyzedStudents] = useState<StudentResult[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isCompleted, setIsCompleted] = useState<boolean>(false);
+  const [downloadSuccess, setDownloadSuccess] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Map raw analysis to StudentResult objects sorted numerically by student number
+  const mapAnalysisToStudentResults = (raw: BatchStudentAnalysis[]): StudentResult[] => {
+    if (!currentExam) return [];
+
+    const mapped: StudentResult[] = raw.map((st, idx) => {
+      const mappedScores = currentExam.questions.map((q) => {
+        const found = st.scores?.find((sc) => sc.questionNumber === q.questionNumber);
+        return {
+          questionNumber: q.questionNumber,
+          score: found && found.score !== undefined ? found.score : null,
+          maxScore: q.maxScore,
+          confidence: found?.confidence ?? 0.95,
+          teacherNote: found?.teacherNote,
+          isOverridden: false,
+        };
+      });
+
+      const totalScore = mappedScores.reduce(
+        (sum, q) => sum + (typeof q.score === 'number' ? q.score : 0),
+        0
+      );
+      const totalExamMax = currentExam.totalMaxScore || 100;
+      const scaledGrade =
+        totalExamMax > 0 ? Math.round((totalScore / totalExamMax) * 100) : totalScore;
+      const hasMissing = mappedScores.some((q) => q.score === null || isNaN(q.score));
+
+      return {
+        id: `batch-${Date.now()}-${idx}-${st.studentNumber || idx}`,
+        examId: currentExam.id,
+        studentNumber: st.studentNumber ? String(st.studentNumber).trim() : `${681 + idx}`,
+        studentName: st.studentName ? String(st.studentName).trim() : `Öğrenci ${idx + 1}`,
+        className: st.className || `${currentExam.gradeClass}/${currentExam.section}`,
+        scores: mappedScores,
+        totalScore,
+        scaledGrade,
+        hasMissingScores: hasMissing,
+        notes: st.notes || (st.pagesDetected ? `Kaynak: ${st.pagesDetected}` : undefined),
+        scannedAt: new Date().toISOString(),
+        verifiedAt: new Date().toISOString(),
+      };
+    });
+
+    // Numerical sort: smallest to largest student number
+    mapped.sort((a, b) => {
+      const numA = parseInt(a.studentNumber.replace(/\D/g, ''), 10) || 0;
+      const numB = parseInt(b.studentNumber.replace(/\D/g, ''), 10) || 0;
+      return numA - numB;
+    });
+
+    return mapped;
+  };
 
   // Handle local PDF upload
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -57,8 +113,8 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
       name: file.name,
       sizeMb: (file.size / (1024 * 1024)).toFixed(2),
     });
-    setDiscoveredStudents([]);
-    setIsCompleted(false);
+    setAnalyzedStudents([]);
+    setDownloadSuccess(null);
   };
 
   // Generate Sample Multi-Student PDF for 1-click test
@@ -77,8 +133,8 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
         name: sampleFile.name,
         sizeMb: (sampleFile.size / (1024 * 1024)).toFixed(2),
       });
-      setDiscoveredStudents([]);
-      setIsCompleted(false);
+      setAnalyzedStudents([]);
+      setDownloadSuccess(null);
     } catch (err: any) {
       setErrorMessage('Örnek PDF oluşturulamadı: ' + err.message);
     } finally {
@@ -86,23 +142,29 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
     }
   };
 
-  // Start Gemini Batch Processing
+  // Start Gemini Batch Processing & Auto-save to Gradebook
   const handleStartAnalysis = async () => {
     if (!selectedFile || !currentExam) return;
 
     setIsProcessing(true);
     setErrorMessage(null);
-    setDiscoveredStudents([]);
-    setIsCompleted(false);
+    setAnalyzedStudents([]);
+    setDownloadSuccess(null);
 
     try {
       const results = await processBatchExamPdf(selectedFile, currentExam, (prog) => {
         setProgress(prog);
-        setDiscoveredStudents(prog.foundStudents);
+        const mappedProg = mapAnalysisToStudentResults(prog.foundStudents);
+        setAnalyzedStudents(mappedProg);
       });
 
-      setDiscoveredStudents(results);
-      setIsCompleted(true);
+      const finalMapped = mapAnalysisToStudentResults(results);
+      setAnalyzedStudents(finalMapped);
+
+      // Auto-save all parsed students to the exam gradebook
+      if (finalMapped.length > 0) {
+        onBulkStudentsImported(finalMapped);
+      }
     } catch (err: any) {
       console.error('Batch PDF processing error:', err);
       setErrorMessage(
@@ -113,55 +175,57 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
     }
   };
 
-  // Final Confirmation: Save All Discovered Students to Database
-  const handleSaveAllToGradebook = () => {
-    if (!currentExam || discoveredStudents.length === 0) return;
+  // Direct Excel Export Handlers
+  const handleDownloadExcel = (type: 'A' | 'B' | 'C') => {
+    if (!currentExam || analyzedStudents.length === 0) return;
 
-    const studentResults: StudentResult[] = discoveredStudents.map((st, idx) => {
-      // Map scores to exam questions
-      const mappedScores = currentExam.questions.map((q) => {
-        const found = st.scores?.find((sc) => sc.questionNumber === q.questionNumber);
-        return {
-          questionNumber: q.questionNumber,
-          score: found && found.score !== undefined ? found.score : null,
-          maxScore: q.maxScore,
-          confidence: found?.confidence ?? 0.9,
-          teacherNote: found?.teacherNote,
-          isOverridden: false,
-        };
-      });
+    try {
+      if (type === 'A') {
+        exportQuestionScoresExcel(currentExam, analyzedStudents);
+        setDownloadSuccess('Soru Bazında e-Okul Uyumlu Excel (.xlsx) başarıyla indirildi!');
+      } else if (type === 'B') {
+        exportTotalScoresSummary(currentExam, analyzedStudents);
+        setDownloadSuccess('Özet Toplam Not Listesi (.xlsx) başarıyla indirildi!');
+      } else if (type === 'C') {
+        exportFullDetailedExcel(currentExam, analyzedStudents);
+        setDownloadSuccess('Ayrıntılı Sınav Karnesi & İstatistik Exceli (.xlsx) başarıyla indirildi!');
+      }
 
-      const totalScore = mappedScores.reduce(
-        (sum, q) => sum + (typeof q.score === 'number' ? q.score : 0),
-        0
-      );
-      const totalExamMax = currentExam.totalMaxScore || 100;
-      const scaledGrade =
-        totalExamMax > 0 ? Math.round((totalScore / totalExamMax) * 100) : totalScore;
-      const hasMissing = mappedScores.some((q) => q.score === null || isNaN(q.score));
-
-      return {
-        id: `batch-${Date.now()}-${idx}-${st.studentNumber || idx}`,
-        examId: currentExam.id,
-        studentNumber: st.studentNumber ? String(st.studentNumber).trim() : `${idx + 1}`,
-        studentName: st.studentName ? String(st.studentName).trim() : `Öğrenci ${idx + 1}`,
-        className: st.className || `${currentExam.gradeClass}/${currentExam.section}`,
-        scores: mappedScores,
-        totalScore,
-        scaledGrade,
-        hasMissingScores: hasMissing,
-        notes: st.notes || (st.pagesDetected ? `Kaynak: ${st.pagesDetected}` : undefined),
-        scannedAt: new Date().toISOString(),
-        verifiedAt: new Date().toISOString(),
-      };
-    });
-
-    onBulkStudentsImported(studentResults);
+      setTimeout(() => setDownloadSuccess(null), 4000);
+    } catch (err: any) {
+      alert('Excel dosyası oluşturulurken hata: ' + err.message);
+    }
   };
 
-  // Remove a student row before import if needed
-  const handleRemoveStudent = (indexToRemove: number) => {
-    setDiscoveredStudents((prev) => prev.filter((_, idx) => idx !== indexToRemove));
+  // Modify individual score inline in the table
+  const handleScoreEdit = (studentId: string, qNum: number, newValStr: string) => {
+    setAnalyzedStudents((prev) =>
+      prev.map((st) => {
+        if (st.id === studentId) {
+          const valNum = newValStr === '' ? null : Math.max(0, parseFloat(newValStr) || 0);
+          const updatedScores = st.scores.map((sc) =>
+            sc.questionNumber === qNum ? { ...sc, score: valNum, isOverridden: true } : sc
+          );
+          const totalScore = updatedScores.reduce((sum, q) => sum + (q.score || 0), 0);
+          const totalExamMax = currentExam?.totalMaxScore || 100;
+          const scaledGrade =
+            totalExamMax > 0 ? Math.round((totalScore / totalExamMax) * 100) : totalScore;
+
+          return {
+            ...st,
+            scores: updatedScores,
+            totalScore,
+            scaledGrade,
+          };
+        }
+        return st;
+      })
+    );
+  };
+
+  // Remove single row
+  const handleRemoveStudent = (studentId: string) => {
+    setAnalyzedStudents((prev) => prev.filter((s) => s.id !== studentId));
   };
 
   if (!currentExam) {
@@ -192,13 +256,13 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
         <div>
           <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-1">
             <Layers className="w-4 h-4 text-emerald-400" />
-            Toplu Sınav Kâğıdı Analizi
+            Toplu Sınav Kâğıdı Analizi & Excel Aktarımı
           </div>
           <h1 className="text-xl font-bold text-white">
             Çok Sayfalı PDF ile Otomatik Sınıf Okuma
           </h1>
           <p className="text-xs text-slate-300 mt-0.5">
-            Örn: Fotokopiden taranmış 37 öğrencinin önlü-arkalı tek bir PDF'ini yükleyin; Gemini yapay zekâ her öğrenciyi ayrıştırıp puanlarını çıkarsın.
+            Fotokopiden taranmış 37 öğrencinin önlü-arkalı tek bir PDF'ini yükleyin; Gemini yapay zekâ her öğrenciyi ayrıştırıp puanlarını çıkarsın ve doğrudan Excel tablosuna dönüştürsün.
           </p>
         </div>
 
@@ -259,7 +323,7 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
                   Toplu Sınav PDF Dosyasını Buraya Sürükleyin veya Seçin
                 </span>
                 <span className="text-xs text-slate-500 block mt-1">
-                  Tek bir PDF dosyasında 1-100 sayfa arası tüm sınıf kâğıtları bulunabilir
+                  Örn: 37 öğrencinin önlü-arkalı tek bir PDF'i (1-100 sayfa)
                 </span>
               </div>
             )}
@@ -279,7 +343,7 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
           <div className="space-y-3">
             <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5 text-emerald-600" />
-              Toplu Okuma Kuralları
+              Toplu Okuma & Excel Çıktısı
             </h3>
 
             <div className="text-xs text-slate-600 space-y-2 leading-relaxed">
@@ -290,7 +354,7 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
                 <strong>2. Kesintisiz Parçalı Tarama:</strong> 74 sayfalık büyük PDF'ler tarayıcıda sayfa bloklarına bölünerek işlenir ve ilerleme çubuğuyla anlık gösterilir.
               </p>
               <p>
-                <strong>3. Kontrol Edilebilir Liste:</strong> Tarama tamamlandıktan sonra tespit edilen tüm öğrenciler tek bir butonla not çizelgesine kaydedilir ve Excel indirilebilir.
+                <strong>3. Anında Excel İndirme:</strong> Analiz tamamlandığı anda öğrenciler numaralarına göre sıralanır ve tek tıkla e-Okul uyumlu .xlsx Excel dosyası oluşturulur.
               </p>
             </div>
           </div>
@@ -312,12 +376,12 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
               {isProcessing ? (
                 <>
                   <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />
-                  <span>PDF İnceleniyor...</span>
+                  <span>PDF İnceleniyor ve Sayfalar Ayrıştırılıyor...</span>
                 </>
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  <span>Toplu PDF'i Yapay Zekâ ile Çözümle</span>
+                  <span>Toplu PDF'i Çözümle ve Excel Oluştur</span>
                   <ArrowRight className="w-4 h-4 ml-1" />
                 </>
               )}
@@ -349,145 +413,185 @@ export const BatchPdfUploader: React.FC<BatchPdfUploaderProps> = ({
 
           <div className="text-[11px] text-slate-500 flex items-center justify-between">
             <span>İşlenen Blok: {progress.currentChunk} / {progress.totalChunks}</span>
-            <span>Tespit Edilen Öğrenci Sayısı: <strong className="text-slate-900">{discoveredStudents.length}</strong></span>
+            <span>Tespit Edilen Öğrenci Sayısı: <strong className="text-slate-900">{analyzedStudents.length}</strong></span>
           </div>
         </div>
       )}
 
-      {/* Discovered Students Table */}
-      {discoveredStudents.length > 0 && (
-        <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden space-y-4 p-5">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
-            <div>
-              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Users className="w-4 h-4 text-emerald-600" />
-                Tespit Edilen Öğrenci Sınav Kâğıtları ({discoveredStudents.length} Öğrenci)
-              </h2>
-              <p className="text-xs text-slate-500">
-                PDF içerisinden okunan kırmızı kalem puanları ve öğrenci bilgileri aşağıdadır.
+      {/* EXCEL DOWNLOAD & RESULT SECTION (Promptly shown as requested by user) */}
+      {analyzedStudents.length > 0 && (
+        <div className="space-y-5 animate-in fade-in duration-300">
+          
+          {/* Download Notification Card */}
+          <div className="bg-emerald-50 border-2 border-emerald-500 rounded-2xl p-5 sm:p-6 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-xs font-bold text-emerald-800 uppercase tracking-wide">
+                <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                Analiz Tamamlandı: {analyzedStudents.length} Öğrenci Excel Formatında Düzenlendi!
+              </div>
+              <p className="text-xs text-slate-700">
+                Öğrenciler okul numarasına göre (küçükten büyüğe) sıralandı ve soru puanları hazırlandı.
+                Aşağıdaki butona basarak resmi e-Okul uyumlu <strong>.xlsx</strong> dosyasını hemen indirebilirsiniz.
               </p>
             </div>
 
-            {/* Bulk Save CTA */}
-            <div className="flex items-center gap-2">
+            {/* Prominent Instant Download Action */}
+            <div className="flex items-center gap-2 flex-wrap shrink-0">
               <button
                 type="button"
-                onClick={handleSaveAllToGradebook}
-                className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors cursor-pointer"
+                onClick={() => handleDownloadExcel('A')}
+                className="flex items-center gap-2 px-5 py-3 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold text-xs rounded-xl shadow-md transition-all cursor-pointer"
               >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Tümünü Sınıf Listesine Aktar ve Kaydet</span>
+                <Download className="w-4 h-4" />
+                <span>📥 e-Okul Soru Bazlı Excel İndir (.xlsx)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleDownloadExcel('B')}
+                className="flex items-center gap-1.5 px-3.5 py-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer"
+                title="Toplam Not Listesi İndir"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                <span>Özet Excel</span>
               </button>
             </div>
           </div>
 
-          {/* Table */}
-          <div className="overflow-x-auto border border-slate-200 rounded-xl">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-900 text-white font-semibold divide-x divide-slate-800">
-                  <th className="px-3 py-2.5 w-12 text-center">No</th>
-                  <th className="px-3 py-2.5 w-20 text-center">Okul No</th>
-                  <th className="px-4 py-2.5 min-w-[150px]">Adı Soyadı</th>
-                  <th className="px-2 py-2.5 w-16 text-center">Sınıf</th>
-                  <th className="px-3 py-2.5 w-24 text-center">Sayfa</th>
-                  
-                  {/* Exam Questions */}
-                  {currentExam.questions.map((q) => (
-                    <th key={q.questionNumber} className="px-2 py-2.5 w-14 text-center">
-                      S{q.questionNumber}
-                    </th>
-                  ))}
+          {/* Download Success Toast Notice */}
+          {downloadSuccess && (
+            <div className="p-3 bg-emerald-100 border border-emerald-300 text-emerald-900 rounded-xl text-xs font-semibold flex items-center gap-2">
+              <Check className="w-4 h-4 text-emerald-700" />
+              <span>{downloadSuccess}</span>
+            </div>
+          )}
 
-                  <th className="px-3 py-2.5 w-20 text-center bg-slate-800">Toplam</th>
-                  <th className="px-2 py-2.5 w-12 text-center">Sil</th>
-                </tr>
-              </thead>
+          {/* Arranged Student Table */}
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Users className="w-4 h-4 text-emerald-600" />
+                  Düzenlenmiş Öğrenci Not Listesi ({analyzedStudents.length} Öğrenci)
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Tablodaki puanları isterseniz doğrudan değiştirebilirsiniz; değişiklikler Excel'e anında yansır.
+                </p>
+              </div>
 
-              <tbody className="divide-y divide-slate-200 text-slate-700">
-                {discoveredStudents.map((st, idx) => {
-                  const scoresSum = st.scores?.reduce((sum, s) => sum + (s.score || 0), 0) || 0;
+              <div className="text-xs text-slate-600 font-medium">
+                Sınıf: <strong>{currentExam.gradeClass}/{currentExam.section}</strong> · Ders: <strong>{currentExam.courseName}</strong>
+              </div>
+            </div>
 
-                  return (
-                    <tr key={idx} className="hover:bg-slate-50 divide-x divide-slate-100">
+            {/* Table */}
+            <div className="overflow-x-auto border border-slate-200 rounded-xl">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-900 text-white font-semibold divide-x divide-slate-800">
+                    <th className="px-3 py-2.5 w-12 text-center">Sıra</th>
+                    <th className="px-3 py-2.5 w-20 text-center">Okul No</th>
+                    <th className="px-4 py-2.5 min-w-[150px]">Adı Soyadı</th>
+                    <th className="px-2 py-2.5 w-16 text-center">Sınıf</th>
+                    
+                    {/* Exam Questions */}
+                    {currentExam.questions.map((q) => (
+                      <th key={q.questionNumber} className="px-2 py-2.5 w-16 text-center">
+                        <div>S{q.questionNumber}</div>
+                        <div className="text-[10px] text-slate-400 font-normal">({q.maxScore}P)</div>
+                      </th>
+                    ))}
+
+                    <th className="px-3 py-2.5 w-20 text-center bg-slate-800">Toplam</th>
+                    <th className="px-3 py-2.5 w-20 text-center bg-emerald-950 text-emerald-300">100'lük</th>
+                    <th className="px-2 py-2.5 w-12 text-center">Sil</th>
+                  </tr>
+                </thead>
+
+                <tbody className="divide-y divide-slate-200 text-slate-700">
+                  {analyzedStudents.map((st, idx) => (
+                    <tr key={st.id} className="hover:bg-slate-50 divide-x divide-slate-100">
                       <td className="px-3 py-2 text-center text-slate-400 font-mono tabular-nums">
                         {idx + 1}
                       </td>
 
                       <td className="px-3 py-2 text-center font-bold text-slate-900 font-mono tabular-nums">
-                        {st.studentNumber || '-'}
+                        {st.studentNumber}
                       </td>
 
-                      <td className="px-4 py-2 font-semibold text-slate-900">
-                        {st.studentName || 'İsimsiz'}
+                      <td className="px-4 py-2 font-semibold text-slate-900 whitespace-nowrap">
+                        {st.studentName}
                       </td>
 
                       <td className="px-2 py-2 text-center text-slate-500">
-                        {st.className || `${currentExam.gradeClass}/${currentExam.section}`}
+                        {st.className}
                       </td>
 
-                      <td className="px-3 py-2 text-center text-[11px] text-slate-500 font-mono">
-                        {st.pagesDetected || '-'}
-                      </td>
-
-                      {/* Question Scores */}
+                      {/* Question Scores (Editable directly!) */}
                       {currentExam.questions.map((q) => {
-                        const match = st.scores?.find((s) => s.questionNumber === q.questionNumber);
+                        const match = st.scores.find((s) => s.questionNumber === q.questionNumber);
                         const sc = match?.score;
 
                         return (
-                          <td
-                            key={q.questionNumber}
-                            className="px-2 py-2 text-center font-mono tabular-nums font-semibold"
-                          >
-                            {sc !== undefined && sc !== null ? (
-                              <span className={sc === 0 ? 'text-slate-400' : 'text-slate-900'}>
-                                {sc}
-                              </span>
-                            ) : (
-                              <span className="text-amber-500">?</span>
-                            )}
+                          <td key={q.questionNumber} className="px-1 py-1.5 text-center">
+                            <input
+                              type="number"
+                              min="0"
+                              max={q.maxScore}
+                              value={sc !== null && sc !== undefined ? sc : ''}
+                              placeholder="?"
+                              onChange={(e) => handleScoreEdit(st.id, q.questionNumber, e.target.value)}
+                              className="w-12 px-1 py-0.5 border border-slate-200 rounded text-center text-xs font-bold font-mono tabular-nums bg-white focus:ring-1 focus:ring-emerald-500 outline-none"
+                            />
                           </td>
                         );
                       })}
 
                       {/* Total */}
                       <td className="px-3 py-2 text-center font-bold text-slate-900 font-mono tabular-nums bg-slate-50">
-                        {scoresSum}
+                        {st.totalScore}
+                      </td>
+
+                      {/* Scaled Grade */}
+                      <td className="px-3 py-2 text-center font-bold text-emerald-800 font-mono tabular-nums bg-emerald-50">
+                        {st.scaledGrade}
                       </td>
 
                       {/* Remove single row */}
                       <td className="px-2 py-2 text-center">
                         <button
                           type="button"
-                          onClick={() => handleRemoveStudent(idx)}
-                          className="p-1 text-slate-400 hover:text-red-600 rounded"
+                          onClick={() => handleRemoveStudent(st.id)}
+                          className="p-1 text-slate-400 hover:text-red-600 rounded cursor-pointer"
                           title="Öğrenciyi Kaldır"
                         >
                           <Trash2 className="w-3.5 h-3.5 mx-auto" />
                         </button>
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
 
-          {/* Bottom Confirmation Bar */}
-          <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3">
-            <span className="text-xs text-slate-500">
-              Bu öğrencileri aktardıktan sonra Öğrenci Listesi'nden inceleyebilir veya doğrudan Excel formatında indirebilirsiniz.
-            </span>
+            {/* Bottom Actions Bar */}
+            <div className="pt-3 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-slate-100">
+              <span className="text-xs text-slate-500">
+                Tüm öğrenci puanları sisteme kaydedildi. Listeyi istediğiniz an Öğrenci Listesi sekmesinden de inceleyebilirsiniz.
+              </span>
 
-            <button
-              type="button"
-              onClick={handleSaveAllToGradebook}
-              className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors cursor-pointer"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              <span>{discoveredStudents.length} Öğrenciyi Sınıfa Kaydet</span>
-            </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleDownloadExcel('A')}
+                  className="flex items-center gap-2 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Düzenlenmiş Excel'i İndir (.xlsx)</span>
+                </button>
+              </div>
+            </div>
+
           </div>
 
         </div>
